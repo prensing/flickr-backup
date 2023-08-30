@@ -10,12 +10,11 @@ import shutil
 import socket
 import sys
 import urllib
-from functools import reduce
+import re
+import logging
 
 import flickr_api
-import humanfriendly
 
-_forbidden_characters = r'<>:"/\|?*'
 _extensions = [".jpg", ".mov", ".mp4", ".png", ".flv", ".gif"]
 
 # monkey patch to fix bug in Walker
@@ -25,45 +24,56 @@ if not hasattr(flickr_api.Walker, '__next__'):
 
 def main():
     parser = argparse.ArgumentParser(description="Download all your photos and videos on Flickr")
-    parser.add_argument('destination_directory', metavar='d', type=str, help='Destination directory')
-    parser.add_argument('--delete', action='store_true', help="Delete files in destination directory that don't have corresponding items in the Flickr account")
-    parser.add_argument('--albums', action='store_true', help='Create album directories and symlink photos there. (Windows not supported because this feature uses symlinks)')
+    parser.add_argument('--delete', action='store_true',
+                        help="Delete files in destination directory that don't have corresponding items in the Flickr account")
     parser.add_argument('--skip-errors', '-s', action='store_true', help='If there is an error downloading a file, skip it')
+    parser.add_argument('--verbose', '-v', default=0, action='count', help='Verbose')
+    parser.add_argument('destination_directory', metavar='d', type=str, help='Destination directory')
+
     args = parser.parse_args()
     download_dir = args.destination_directory
 
+    logging.basicConfig(format='%(levelname)s: %(message)s')
+    logging.getLogger().setLevel(logging.INFO - 10*args.verbose)
+
     if not os.path.exists(download_dir):
-        sys.stderr.write("Destination directory %s does not exist\n" % (download_dir,))
+        logging.error(f"Destination directory {download_dir} does not exist")
         sys.exit(1)
 
     set_up_flickr_keys()
     set_up_account_permissions()
 
     user = flickr_api.test.login()
-    total_photos = user.getPhotos().info.total
     walker = flickr_api.Walker(user.getPhotos)
+
     files_in_flickr = set()
     dirs_in_flickr = set()
 
-    i = 0
     for photo in walker:
-        i += 1
-        print("Item %04d/%04d entitled %s" % (i, total_photos, photo.title))
+        albums = fetch_albums(photo)
+        if not albums:
+            first_album = 'NO_ALBUM'
+            extra_albums = []
+        else:
+            first_album = destination(albums[0])
+            extra_albums = albums[1:]
+
         try:
-            filename = download_item(photo, download_dir)
+            filename = download_item(photo, os.path.join(download_dir, first_album))
+            files_in_flickr.add(os.path.abspath(filename))
         except urllib.error.URLError as ee:
             if args.skip_errors:
-                print("Could not download file successfully, got error: %s" % (ee,))
+                logging.warning(f"Could not download file successfully, got error: {ee}")
             else:
                 raise
-        if args.albums:
-            files, dirs = add_to_albums(photo, filename, download_dir)
-            files_in_flickr.update(files)
-            dirs_in_flickr.update(dirs)
-        files_in_flickr.add(os.path.abspath(filename))
+
+        files, dirs = add_to_albums(filename, download_dir, extra_albums)
+        files_in_flickr.update(files)
+        dirs_in_flickr.update(dirs)
 
     if args.delete:
         clean_stale_files(files_in_flickr, dirs_in_flickr, download_dir)
+    return
 
 
 def automatic_retry(function):
@@ -75,15 +85,15 @@ def automatic_retry(function):
                 return function(*args, **kwargs)
             except (urllib.error.URLError, urllib.error.ContentTooShortError) as ee:
                 retries += 1
-                print("%r, retrying (%d)" % (ee, retries))
+                logging.warning(f"{ee}, retrying ({retries})")
             except socket.error as ee:
                 if ee.errno == errno.ECONNRESET:
                     retries += 1
-                    print("socket.error Connection reset by peer, retrying (%d)" % retries)
+                    logging.warning(f"socket.error Connection reset by peer, retrying ({retries})")
                 else:
-                    print("Unrecognized socket error", file=sys.stderr)
+                    logging.error("Unrecognized socket error")
                     raise
-        print("Reached number of retries: %d" % (retries,))
+        logging.error(f"Reached number of retries: {retries}")
         return function(*args, **kwargs)
 
     return wrapper
@@ -112,14 +122,13 @@ def set_up_account_permissions():
 
         auth_handler.save(auth_filename)
         print("Authorization saved to %s" % (auth_filename,))
+    return
 
 
 def get_config_directory():
     home_directory = os.getenv("HOME", os.path.expanduser("~"))
-    return os.path.join(
-        os.getenv("XDG_CONFIG_HOME", os.path.join(home_directory, ".config")),
-        "backup-all-my-flickr-photos",
-    )
+    return os.path.join(os.getenv("XDG_CONFIG_HOME", os.path.join(home_directory, ".config")),
+                        "backup-all-my-flickr-photos")
 
 
 def set_up_flickr_keys():
@@ -168,7 +177,7 @@ def set_up_flickr_keys():
                     continue
                 else:
                     raise
-                
+
         json_data = {
             'api_key': api_key,
             'api_secret': api_secret,
@@ -177,16 +186,20 @@ def set_up_flickr_keys():
             os.makedirs(config_directory)
         with open(keys_filename, "wb") as f:
             f.write(json.dumps(json_data).encode("UTF-8"))
-        print("API key and secret saved to %s" % (keys_filename,))
+        logging.info(f"API key and secret saved to {keys_filename}")
+    return
 
 
 def destination(obj):
     if obj.title:
-        title = reduce(lambda s, char: s.replace(char, ''), _forbidden_characters, obj.title)
-        if title.startswith('.'):
-            title = ' %s' % title
-        return "%s %s" % (title, obj.id)
-    return "%s" % (obj.id,)
+        try:
+            title = re.sub(r'(^\.|[/\'\“”*?|<>]+)', '_', obj.title)
+            return title
+        except Exception as e:
+            logging.exception(e)
+            print(obj)
+
+    return str(obj.id)
 
 
 @automatic_retry
@@ -194,7 +207,10 @@ def download_item(photo, download_dir):
     destname = destination(photo)
 
     def path(extension):
-        return os.path.join(download_dir, "%s%s" % (destname, extension))
+        return os.path.join(download_dir, f"{destname}{extension}")
+
+    if not os.path.exists(download_dir):
+        os.makedirs(download_dir)
 
     file_exists = any(os.path.exists(path(extension)) for extension in _extensions)
     if not file_exists:
@@ -204,7 +220,7 @@ def download_item(photo, download_dir):
             extension = guess_extension(url, headers)
             to = path(extension)
             shutil.move(os.path.join(download_dir, "tmp"), to)
-            print("Done: %s" % (to,))
+            logging.info(f"Downloaded '{to}'")
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -214,21 +230,21 @@ def download_item(photo, download_dir):
         if os.path.exists(path_guess):
             return path_guess
 
-    raise(Exception("Expected to find file %s.EXTENSION" % (destname,)))
+    raise(Exception(f"Expected to find file {destname}.EXTENSION"))
 
 
 def download_file(photo, filename):
     url = photo.getPhotoFile(preferred_size(photo))
 
-    def report(count_of_block, block_size, total_size):
-        # print(count_of_block, block_size, total_size)
-        percentage = (count_of_block * block_size * 100 ) / total_size
-        sys.stdout.write("\r%3d%% of %s" % (percentage, humanfriendly.format_size(total_size)))
-        sys.stdout.flush()
-        if percentage >= 100:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-    _, headers = urllib.request.urlretrieve(url, filename, report)
+    # def report(count_of_block, block_size, total_size):
+    #     # print(count_of_block, block_size, total_size)
+    #     percentage = (count_of_block * block_size * 100) / total_size
+    #     sys.stdout.write("\r%3d%% of %s" % (percentage, humanfriendly.format_size(total_size)))
+    #     sys.stdout.flush()
+    #     if percentage >= 100:
+    #         sys.stdout.write("\n")
+    #         sys.stdout.flush()
+    _, headers = urllib.request.urlretrieve(url, filename)
     return url, headers
 
 
@@ -238,7 +254,7 @@ def preferred_size(photo):
         return 'Video Original'
     elif 'Original' in sizes:
         return 'Original'
-    raise(Exception("Could not find size 'Video Original' or 'Original' for photo %s" % (photo,)))
+    raise(Exception(f"Could not find size 'Video Original' or 'Original' for photo {photo}"))
 
 
 def guess_extension(url, headers):
@@ -255,11 +271,31 @@ def guess_extension(url, headers):
         return 'mp4'
     # It's tempting to look at the Content-Type header here, but in the real
     # world, Flickr sets the wrong value for .mov files. So give up instead.
-    raise(Exception("Cannot guess extension for URL %s" % (url,)))
+    raise(Exception(f"Cannot guess extension for URL {url}"))
 
 
-def add_to_albums(photo, filename, download_dir):
-    albums, _groups = automatic_retry(photo.getAllContexts)()
+def fetch_albums(photo):
+    albums, _ = automatic_retry(photo.getAllContexts)()
+    return albums
+
+
+def add_to_albums(filename, download_dir, albums):
+    dirs = [os.path.join(download_dir, destination(album)) for album in albums]
+    filenames = []
+    basename = os.path.basename(filename)
+    for dirname in dirs:
+        linkname = os.path.join(dirname, basename)
+        filenames.append(linkname)
+        if os.path.exists(linkname):
+            continue
+        if not os.path.exists(dirname):
+            os.makedirs(dirname)
+        relpath = os.path.relpath(filename, dirname)
+        os.symlink(relpath, linkname)
+    return filenames, dirs
+
+
+def link_to_albums(filename, download_dir, albums):
     dirs = [os.path.join(download_dir, destination(album)) for album in albums]
     filenames = []
     basename = os.path.basename(filename)
@@ -300,7 +336,7 @@ def clean_stale_files(files_in_flickr, dirs_in_flickr, download_dir):
                 print("Deleting file %s" % path)
                 os.remove(path)
                 count_files_deleted += 1
-    print("Deleted %d files and %d directories" % (count_files_deleted, count_dirs_deleted))
+    logging.info(f"Deleted {count_files_deleted} files and {count_dirs_deleted} directories")
 
 
 if __name__ == "__main__":
